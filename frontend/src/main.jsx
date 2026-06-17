@@ -5,6 +5,16 @@ import "./styles.css";
 
 const API = "/api";
 const LAST_JOB_KEY = "imageScanner.lastJobId";
+const SCAN_SETTINGS_KEY = "imageScanner.scanSettings";
+const IMPORT_SETTINGS_KEY = "imageScanner.importSettings";
+
+function loadScanSettings() {
+  try {
+    return JSON.parse(window.localStorage.getItem(SCAN_SETTINGS_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes)) return "-";
@@ -23,10 +33,34 @@ function formatDate(seconds) {
   return new Date(seconds * 1000).toLocaleString();
 }
 
+function getFailedPaths(job) {
+  const paths = new Set();
+  (job?.failed_records || []).forEach((record) => {
+    if (record?.path) paths.add(record.path);
+  });
+  (job?.errors || []).forEach((error) => {
+    const match = String(error).match(/^扫描失败 (.*?): /);
+    if (match?.[1]) paths.add(match[1]);
+  });
+  return Array.from(paths);
+}
+
 function App() {
-  const [directories, setDirectories] = useState("/scan");
-  const [convert, setConvert] = useState(false);
-  const [workers, setWorkers] = useState("");
+  const initialSettings = useMemo(loadScanSettings, []);
+  const initialImportSettings = useMemo(() => {
+    try {
+      return JSON.parse(window.localStorage.getItem(IMPORT_SETTINGS_KEY) || "{}");
+    } catch {
+      return {};
+    }
+  }, []);
+  const [directories, setDirectories] = useState(initialSettings.directories || "/scan");
+  const [convert, setConvert] = useState(Boolean(initialSettings.convert));
+  const [fullScan, setFullScan] = useState(Boolean(initialSettings.fullScan));
+  const [workers, setWorkers] = useState(initialSettings.workers || "");
+  const [sourceFile, setSourceFile] = useState(initialImportSettings.sourceFile || "/source");
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState(null);
   const [jobId, setJobId] = useState(null);
   const [job, setJob] = useState(null);
   const [selected, setSelected] = useState(() => new Set());
@@ -81,6 +115,17 @@ function App() {
   }, []);
 
   useEffect(() => {
+    window.localStorage.setItem(
+      SCAN_SETTINGS_KEY,
+      JSON.stringify({ directories, convert, fullScan, workers })
+    );
+  }, [directories, convert, fullScan, workers]);
+
+  useEffect(() => {
+    window.localStorage.setItem(IMPORT_SETTINGS_KEY, JSON.stringify({ sourceFile }));
+  }, [sourceFile]);
+
+  useEffect(() => {
     if (!jobId) return;
     window.localStorage.setItem(LAST_JOB_KEY, jobId);
     let stopped = false;
@@ -109,6 +154,7 @@ function App() {
     const payload = {
       directories: directoryList,
       convert,
+      full_scan: fullScan,
       workers: workers ? Number(workers) : null,
     };
     try {
@@ -123,6 +169,35 @@ function App() {
       setJobId(data.job_id);
     } catch (err) {
       setError(String(err.message || err));
+    }
+  };
+
+  const importSourceFile = async () => {
+    if (!sourceFile.trim() || importing) return;
+    setError("");
+    setImportResult(null);
+    setImporting(true);
+    try {
+      const response = await fetch(`${API}/import`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          path: sourceFile.trim(),
+          workers: workers ? Number(workers) : null,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || JSON.stringify(data));
+      if (data.job_id) {
+        window.localStorage.setItem(LAST_JOB_KEY, data.job_id);
+        setJobId(data.job_id);
+        setJob(null);
+      }
+      setImportResult(data);
+    } catch (err) {
+      setError(String(err.message || err));
+    } finally {
+      setImporting(false);
     }
   };
 
@@ -204,6 +279,33 @@ function App() {
 
   const isRunning = job && !["done", "failed", "cancelled"].includes(job.status);
   const groups = job?.duplicates || [];
+  const failedPaths = useMemo(() => getFailedPaths(job), [job]);
+
+  const deleteFailedFiles = async () => {
+    if (failedPaths.length === 0 || deleting || isRunning) return;
+    const confirmed = window.confirm(`确认删除 ${failedPaths.length} 个异常文件？该操作不可撤销。`);
+    if (!confirmed) return;
+    setDeleting(true);
+    setError("");
+    try {
+      const response = await fetch(`${API}/files`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paths: failedPaths }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const result = await response.json();
+      if (jobId) {
+        const refreshed = await fetch(`${API}/jobs/${jobId}`);
+        if (refreshed.ok) setJob(await refreshed.json());
+      }
+      if (result.deleted?.length === 0) setError("没有删除任何异常文件，可能文件已经不存在或挂载为只读。");
+    } catch (err) {
+      setError(String(err.message || err));
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   return (
     <main className="app-shell">
@@ -239,19 +341,59 @@ function App() {
               <input type="checkbox" checked={convert} onChange={(event) => setConvert(event.target.checked)} />
               <span>转换 JPG/PNG 到 JXL</span>
             </label>
+            <label className="toggle">
+              <input type="checkbox" checked={fullScan} onChange={(event) => setFullScan(event.target.checked)} />
+              <span>全量扫描（忽略缓存）</span>
+            </label>
             <label>
               <span>工作线程</span>
               <input
                 type="number"
                 min="1"
                 max="64"
-                placeholder={job?.default_workers ? `自动 ${job.default_workers}` : "自动=CPU一半"}
+                placeholder={job?.default_workers ? `默认 ${job.default_workers}` : "默认 4"}
                 value={workers}
                 onChange={(event) => setWorkers(event.target.value)}
               />
             </label>
           </div>
         </div>
+      </section>
+
+      <section className="control-band import-band">
+        <div className="title-row">
+          <div>
+            <h2>导入源文件</h2>
+            <p>可输入 /source 导入整个源目录，或输入具体图片文件路径。</p>
+          </div>
+          <button className="primary" onClick={importSourceFile} disabled={!sourceFile.trim() || importing}>
+            {importing ? <Loader2 className="spin" size={18} /> : <FolderSearch size={18} />}
+            导入
+          </button>
+        </div>
+        <div className="import-row">
+          <label>
+            <span>源文件路径</span>
+            <input
+              type="text"
+              placeholder="/source/008c203cb0ce5cf56005d114db47990b.jpg"
+              value={sourceFile}
+              onChange={(event) => setSourceFile(event.target.value)}
+              spellCheck="false"
+            />
+          </label>
+        </div>
+        {importResult && (
+          <div className={`import-result ${importResult.status}`}>
+            {importResult.status === "queued" ? (
+              <p>目录导入任务已开始，任务 ID <code>{importResult.job_id}</code></p>
+            ) : importResult.status === "imported" ? (
+              <p>已导入到 <code>{importResult.target}</code></p>
+            ) : (
+              <p>发现重复文件，未导入。匹配数量 {importResult.duplicates?.length || 0}</p>
+            )}
+          </div>
+        )}
       </section>
 
       {error && <div className="error">{error}</div>}
@@ -360,7 +502,16 @@ function App() {
 
       {job?.errors?.length > 0 && (
         <section className="log-band error-log">
-          <h2>错误日志</h2>
+          <div className="log-header">
+            <div>
+              <h2>错误日志</h2>
+              <p>{failedPaths.length} 个异常文件</p>
+            </div>
+            <button className="danger" onClick={deleteFailedFiles} disabled={failedPaths.length === 0 || deleting || isRunning}>
+              {deleting ? <Loader2 className="spin" size={17} /> : <Trash2 size={17} />}
+              删除所有异常文件
+            </button>
+          </div>
           <div className="log-list">
             {job.errors.slice(-50).map((item, index) => (
               <p key={`${item}-${index}`}>{item}</p>

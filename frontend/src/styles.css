@@ -103,7 +103,7 @@ label span {
   color: #374151;
 }
 
-textarea, input[type="number"] {
+textarea, input[type="number"], input[type="text"] {
   width: 100%;
   border: 1px solid #ccd3dd;
   border-radius: 8px;
@@ -119,9 +119,45 @@ textarea {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
-input[type="number"] {
+input[type="number"], input[type="text"] {
   height: 42px;
   padding: 0 12px;
+}
+
+.import-band {
+  padding-top: 8px;
+}
+
+.import-band h2 {
+  font-size: 22px;
+  line-height: 1.25;
+}
+
+.import-row {
+  margin-top: 16px;
+}
+
+.import-result {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid #cbd5e1;
+  background: white;
+  color: #374151;
+}
+
+.import-result.imported {
+  border-color: #9fd5c8;
+  background: #effaf6;
+}
+
+.import-result.duplicate {
+  border-color: #f3c28f;
+  background: #fff7ed;
+}
+
+.import-result code {
+  overflow-wrap: anywhere;
 }
 
 .settings {
@@ -220,6 +256,20 @@ input[type="number"] {
 .timing-stats {
   padding-top: 10px;
   border-top: 1px solid #e6e9ee;
+}
+
+.log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 10px;
+}
+
+.log-header p {
+  margin-top: 5px;
+  color: #68707f;
+  font-size: 13px;
 }
 
 .results {

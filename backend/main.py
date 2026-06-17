@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".jxl"}
 CONVERT_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 CPU_THREADS = os.cpu_count() or 4
-DEFAULT_WORKERS = max(1, CPU_THREADS // 2)
+DEFAULT_WORKERS = min(4, CPU_THREADS)
 MAX_WORKERS = max(DEFAULT_WORKERS, min(64, CPU_THREADS))
 SLOW_STEP_SECONDS = float(os.getenv("SLOW_STEP_SECONDS", "1.0"))
 SLOW_FILE_SECONDS = float(os.getenv("SLOW_FILE_SECONDS", "2.0"))
@@ -37,6 +37,11 @@ DB_PATH = Path(os.getenv("SCANNER_DB", "/data/scanner.db"))
 SCAN_ROOTS = [
     Path(root).resolve()
     for root in os.getenv("SCAN_ROOTS", "/scan").split(":")
+    if root.strip()
+]
+SOURCE_ROOTS = [
+    Path(root).resolve()
+    for root in os.getenv("SOURCE_ROOTS", "/source:/scan").split(":")
     if root.strip()
 ]
 
@@ -58,11 +63,17 @@ jobs: Dict[str, "ScanJob"] = {}
 class ScanRequest(BaseModel):
     directories: List[str] = Field(min_length=1)
     convert: bool = False
+    full_scan: bool = False
     workers: Optional[int] = Field(default=None, ge=1, le=64)
 
 
 class DeleteRequest(BaseModel):
     paths: List[str] = Field(min_length=1)
+
+
+class ImportRequest(BaseModel):
+    path: str
+    workers: Optional[int] = Field(default=None, ge=1, le=64)
 
 
 @dataclass
@@ -123,6 +134,7 @@ class ScanJob:
     convert_seconds_total: float = 0.0
     sha_index: Dict[str, List[ImageRecord]] = field(default_factory=dict, repr=False)
     phash_index: Dict[str, List[ImageRecord]] = field(default_factory=dict, repr=False)
+    failed_records: List[ImageRecord] = field(default_factory=list)
 
 
 class ScanCancelled(Exception):
@@ -173,6 +185,43 @@ def cache_get(path: Path, size: int, modified_at: float) -> Optional[dict]:
     if not row:
         return None
     return {"sha256": row[0], "phash": row[1], "width": row[2], "height": row[3]}
+
+
+def cache_find_duplicates(sha256: Optional[str], phash: Optional[str]) -> List[dict]:
+    clauses = []
+    params = []
+    if sha256:
+        clauses.append("sha256 = ?")
+        params.append(sha256)
+    if phash:
+        clauses.append("phash = ?")
+        params.append(phash)
+    if not clauses:
+        return []
+    with db_lock, sqlite3.connect(DB_PATH, timeout=30) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT path, size, modified_at, sha256, phash, width, height
+            FROM image_cache
+            WHERE {" OR ".join(clauses)}
+            ORDER BY path
+            LIMIT 100
+            """,
+            params,
+        ).fetchall()
+    return [
+        {
+            "path": row[0],
+            "size": row[1],
+            "modified_at": row[2],
+            "sha256": row[3],
+            "phash": row[4],
+            "width": row[5],
+            "height": row[6],
+            "match_type": "sha256" if sha256 and row[3] == sha256 else "phash",
+        }
+        for row in rows
+    ]
 
 
 def cache_put(record: ImageRecord) -> None:
@@ -244,6 +293,7 @@ def job_to_dict_unlocked(job: ScanJob) -> dict:
                 }
                 for group in job.duplicates
             ],
+            "failed_records": [record.__dict__ for record in job.failed_records],
             "errors": list(job.errors),
             "logs": list(job.logs),
             "cancel_requested": job.cancel_requested,
@@ -316,6 +366,7 @@ def restore_job(snapshot: dict) -> ScanJob:
         "phash_dct_seconds_total",
         "phash_seconds_total",
         "convert_seconds_total",
+        "failed_records",
     }
     for field_name in scalar_fields:
         if field_name in snapshot:
@@ -346,6 +397,11 @@ def restore_job(snapshot: dict) -> ScanJob:
                 job.sha_index.setdefault(record.sha256, []).append(record)
             if record.phash:
                 job.phash_index.setdefault(record.phash, []).append(record)
+    job.failed_records = [
+        record_from_dict(item)
+        for item in snapshot.get("failed_records", [])
+        if item.get("path")
+    ]
     return job
 
 
@@ -479,10 +535,27 @@ def index_record(job: ScanJob, key_type: str, key: Optional[str], record: ImageR
     job.duplicates.sort(key=lambda group: (-len(group.files), group.key_type, group.key))
 
 
+def index_record_unlocked(job: ScanJob, key_type: str, key: Optional[str], record: ImageRecord) -> None:
+    if not key:
+        return
+    index = job.sha_index if key_type == "sha256" else job.phash_index
+    files = index.setdefault(key, [])
+    files.append(record)
+    if len(files) < 2:
+        return
+    for group in job.duplicates:
+        if group.key_type == key_type and group.key == key:
+            group.files = sorted(files, key=lambda item: item.path)
+            return
+    job.duplicates.append(DuplicateGroup(key_type, key, sorted(files, key=lambda item: item.path)))
+    job.duplicates.sort(key=lambda group: (-len(group.files), group.key_type, group.key))
+
+
 def add_record(job: ScanJob, record: ImageRecord) -> None:
     with jobs_lock:
         if record.scan_error:
             job.errors.append(f"扫描失败 {record.path}: {record.scan_error}")
+            job.failed_records.append(record)
             job.failed_files += 1
         else:
             job.scanned_files += 1
@@ -490,8 +563,8 @@ def add_record(job: ScanJob, record: ImageRecord) -> None:
                 job.cache_hit_files += 1
             if record.phash_skipped:
                 job.phash_skipped_files += 1
-            index_record(job, "sha256", record.sha256, record)
-            index_record(job, "phash", record.phash, record)
+            index_record_unlocked(job, "sha256", record.sha256, record)
+            index_record_unlocked(job, "phash", record.phash, record)
     cache_put(record)
 
 
@@ -500,6 +573,18 @@ def remove_deleted_records_from_jobs(paths: List[str]) -> List[dict]:
     snapshots = []
     with jobs_lock:
         for job in jobs.values():
+            job.failed_records = [
+                record for record in job.failed_records if record.path not in deleted
+            ]
+            job.errors = [
+                error
+                for error in job.errors
+                if not any(path in error for path in deleted)
+            ]
+            if job.failed_records:
+                job.failed_files = len(job.failed_records)
+            elif job.failed_files:
+                job.failed_files = len([error for error in job.errors if error.startswith("扫描失败 ")])
             next_groups = []
             for group in job.duplicates:
                 files = [record for record in group.files if record.path not in deleted]
@@ -529,6 +614,19 @@ def validate_user_path(raw_path: str) -> Path:
     if not is_allowed_path(path):
         allowed = ", ".join(str(root) for root in SCAN_ROOTS)
         raise HTTPException(status_code=403, detail=f"路径不在允许范围内: {allowed}")
+    return path
+
+
+def is_allowed_source_path(path: Path) -> bool:
+    resolved = path.resolve()
+    return any(resolved == root or root in resolved.parents for root in SOURCE_ROOTS)
+
+
+def validate_source_path(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser().resolve()
+    if not is_allowed_source_path(path):
+        allowed = ", ".join(str(root) for root in SOURCE_ROOTS)
+        raise HTTPException(status_code=403, detail=f"源文件路径不在允许范围内: {allowed}")
     return path
 
 
@@ -595,6 +693,79 @@ def convert_image(path: Path) -> Optional[Path]:
         if tmp_out.exists():
             tmp_out.unlink(missing_ok=True)
         raise
+
+
+def jxl_import_target(source_path: Path, source_sha256: str) -> Path:
+    root = SCAN_ROOTS[0]
+    directory = root / source_sha256[:2] / source_sha256[2:4]
+    base_name = f"{source_path.stem}.jxl"
+    target = directory / base_name
+    if not target.exists():
+        return target
+    target = directory / f"{source_path.stem}-{source_sha256[:12]}.jxl"
+    if not target.exists():
+        return target
+    return directory / f"{source_path.stem}-{uuid.uuid4().hex[:8]}.jxl"
+
+
+def convert_source_to_jxl(source_path: Path, target_path: Path) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_out = target_path.with_suffix(target_path.suffix + f".{uuid.uuid4().hex}.tmp")
+    ext = source_path.suffix.lower()
+    if ext == ".jxl":
+        shutil.copy2(source_path, tmp_out)
+    elif ext in {".jpg", ".jpeg"}:
+        subprocess.run(
+            ["cjxl", str(source_path), str(tmp_out), "--lossless_jpeg=1", "-e", "7"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    else:
+        subprocess.run(
+            ["cjxl", str(source_path), str(tmp_out), "-q", "90", "-e", "7"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    tmp_out.replace(target_path)
+
+
+def import_one_source_path(source_path: Path) -> dict:
+    if not source_path.exists():
+        raise FileNotFoundError(f"源文件不存在: {source_path}")
+    if not source_path.is_file():
+        raise IsADirectoryError(f"请输入具体源文件路径，不是目录: {source_path}")
+    if source_path.suffix.lower() not in IMAGE_EXTENSIONS:
+        raise ValueError(f"不支持导入非图片文件: {source_path}")
+
+    source_record = scan_image(source_path, ignore_cache=True)
+    if source_record.scan_error:
+        raise RuntimeError(f"源文件扫描失败: {source_record.scan_error}")
+
+    duplicates = cache_find_duplicates(source_record.sha256, source_record.phash)
+    if duplicates:
+        return {
+            "status": "duplicate",
+            "source": source_record.__dict__,
+            "duplicates": duplicates,
+        }
+
+    target_path = jxl_import_target(source_path, source_record.sha256 or uuid.uuid4().hex)
+    convert_source_to_jxl(source_path, target_path)
+    imported_record = scan_image(target_path, converted_from=source_path, ignore_cache=True)
+    if imported_record.scan_error:
+        target_path.unlink(missing_ok=True)
+        raise RuntimeError(f"导入后扫描失败: {imported_record.scan_error}")
+    cache_put(imported_record)
+    return {
+        "status": "imported",
+        "source": source_record.__dict__,
+        "imported": imported_record.__dict__,
+        "target": str(target_path),
+    }
 
 
 def sha256_file(path: Path) -> str:
@@ -706,7 +877,12 @@ def sha_already_seen(job: ScanJob, sha256: Optional[str]) -> bool:
         return sha256 in job.sha_index
 
 
-def scan_image(path: Path, converted_from: Optional[Path] = None, job: Optional[ScanJob] = None) -> ImageRecord:
+def scan_image(
+    path: Path,
+    converted_from: Optional[Path] = None,
+    job: Optional[ScanJob] = None,
+    ignore_cache: bool = False,
+) -> ImageRecord:
     stat = path.stat()
     record = ImageRecord(
         path=str(path),
@@ -715,7 +891,7 @@ def scan_image(path: Path, converted_from: Optional[Path] = None, job: Optional[
         converted_from=str(converted_from) if converted_from else None,
     )
     try:
-        cached = cache_get(path, record.size, record.modified_at)
+        cached = None if ignore_cache else cache_get(path, record.size, record.modified_at)
         if cached:
             record.sha256 = cached["sha256"]
             record.phash = cached["phash"]
@@ -755,7 +931,7 @@ def scan_image(path: Path, converted_from: Optional[Path] = None, job: Optional[
     return record
 
 
-def process_image_path(job: ScanJob, path: Path, convert: bool) -> None:
+def process_image_path(job: ScanJob, path: Path, convert: bool, full_scan: bool) -> None:
     ensure_not_cancelled(job)
     file_started = time.perf_counter()
     targets = [(path, None)]
@@ -777,7 +953,7 @@ def process_image_path(job: ScanJob, path: Path, convert: bool) -> None:
 
     for target, source in targets:
         ensure_not_cancelled(job)
-        record = scan_image(target, source, job)
+        record = scan_image(target, source, job, ignore_cache=full_scan)
         add_timing(job, "sha_seconds_total", record.sha_seconds)
         add_timing(job, "decode_seconds_total", record.decode_seconds)
         add_timing(job, "phash_prepare_seconds_total", record.phash_prepare_seconds)
@@ -843,7 +1019,7 @@ def process_image_path(job: ScanJob, path: Path, convert: bool) -> None:
         persist_job(job)
 
 
-def scan_worker(job: ScanJob, scan_queue: queue.Queue, sentinel, convert: bool) -> None:
+def scan_worker(job: ScanJob, scan_queue: queue.Queue, sentinel, convert: bool, full_scan: bool) -> None:
     with jobs_lock:
         job.active_workers += 1
     try:
@@ -852,7 +1028,7 @@ def scan_worker(job: ScanJob, scan_queue: queue.Queue, sentinel, convert: bool) 
             try:
                 if item is sentinel:
                     return
-                process_image_path(job, item, convert)
+                process_image_path(job, item, convert, full_scan)
             finally:
                 scan_queue.task_done()
     except ScanCancelled:
@@ -890,6 +1066,145 @@ def build_duplicate_groups(records: List[ImageRecord]) -> List[DuplicateGroup]:
     return sorted(groups, key=lambda group: (-len(group.files), group.key_type, group.key))
 
 
+def run_import_directory(job: ScanJob, directory: Path, worker_count: int) -> None:
+    import_queue: queue.Queue = queue.Queue(maxsize=max(256, worker_count * 8))
+    sentinel = object()
+    producer_thread: Optional[threading.Thread] = None
+    worker_threads: List[threading.Thread] = []
+    producer_error: List[Exception] = []
+
+    def producer() -> None:
+        try:
+            for root, _, names in os.walk(directory):
+                ensure_not_cancelled(job)
+                for name in names:
+                    ensure_not_cancelled(job)
+                    path = Path(root) / name
+                    if path.suffix.lower() not in IMAGE_EXTENSIONS:
+                        continue
+                    put_queue(import_queue, path, job)
+                    with jobs_lock:
+                        job.discovered_files += 1
+                        job.total_files = job.discovered_files
+                        job.message = f"正在导入，已发现 {job.discovered_files} 个源图片"
+        except ScanCancelled:
+            pass
+        except Exception as exc:
+            producer_error.append(exc)
+        finally:
+            with jobs_lock:
+                job.discovery_done = True
+            for _ in range(worker_count):
+                put_queue(import_queue, sentinel, job)
+
+    def worker() -> None:
+        with jobs_lock:
+            job.active_workers += 1
+        try:
+            while True:
+                item = get_queue(import_queue, job)
+                try:
+                    if item is sentinel:
+                        return
+                    try:
+                        result = import_one_source_path(item)
+                        with jobs_lock:
+                            job.processed_files += 1
+                            if result["status"] == "duplicate":
+                                job.cache_hit_files += 1
+                                job.message = f"正在导入，已跳过 {job.cache_hit_files} 个重复源图片"
+                            else:
+                                record = record_from_dict(result["imported"])
+                                job.converted_files += 1
+                                job.scanned_files += 1
+                                index_record_unlocked(job, "sha256", record.sha256, record)
+                                index_record_unlocked(job, "phash", record.phash, record)
+                                job.message = f"正在导入，已导入 {job.converted_files} 个源图片"
+                        if result["status"] == "imported":
+                            append_log(job, f"导入成功: {item} -> {result['target']}")
+                        else:
+                            append_log(job, f"发现重复，跳过导入: {item}")
+                    except Exception as exc:
+                        append_error(job, f"导入失败 {item}: {exc}")
+                        with jobs_lock:
+                            job.processed_files += 1
+                    if job.processed_files and job.processed_files % 25 == 0:
+                        persist_job(job)
+                finally:
+                    import_queue.task_done()
+        except ScanCancelled:
+            return
+        finally:
+            with jobs_lock:
+                job.active_workers -= 1
+                job.queue_size = import_queue.qsize()
+
+    try:
+        set_job(job, status="running", message=f"正在发现源目录: {directory}")
+        append_log(job, f"开始导入源目录: {directory} workers={worker_count}")
+        persist_job(job)
+
+        producer_thread = threading.Thread(target=producer, name=f"import-producer-{job.id}", daemon=True)
+        producer_thread.start()
+        for index in range(worker_count):
+            thread = threading.Thread(target=worker, name=f"import-worker-{job.id}-{index}", daemon=True)
+            worker_threads.append(thread)
+            thread.start()
+
+        while producer_thread.is_alive() or any(thread.is_alive() for thread in worker_threads):
+            ensure_not_cancelled(job)
+            if producer_error:
+                raise producer_error[0]
+            with jobs_lock:
+                job.queue_size = import_queue.qsize()
+            time.sleep(0.25)
+
+        if producer_error:
+            raise producer_error[0]
+
+        set_job(
+            job,
+            status="done",
+            message=(
+                f"导入完成，导入 {job.converted_files} 个，"
+                f"重复跳过 {job.cache_hit_files} 个，失败 {job.failed_files} 个"
+            ),
+            discovery_done=True,
+            finished_at=time.time(),
+        )
+        append_log(
+            job,
+            (
+                f"导入完成 discovered={job.discovered_files} processed={job.processed_files} "
+                f"imported={job.converted_files} duplicates={job.cache_hit_files} failed={job.failed_files}"
+            ),
+        )
+        persist_job(job)
+    except ScanCancelled:
+        set_job(job, status="cancelled", message="已停止导入任务", finished_at=time.time())
+        append_log(job, f"导入停止 processed={job.processed_files} imported={job.converted_files}")
+        persist_job(job)
+    except Exception as exc:
+        set_job(job, status="failed", message=str(exc), finished_at=time.time())
+        append_log(job, f"导入失败: {exc}")
+        persist_job(job)
+    finally:
+        if is_cancelled(job) or producer_error:
+            drain_queue(import_queue)
+            put_sentinels(import_queue, worker_count, sentinel)
+        if producer_thread:
+            producer_thread.join(timeout=2)
+        for thread in worker_threads:
+            thread.join(timeout=2)
+        with jobs_lock:
+            job.queue_size = import_queue.qsize()
+            if job.cancel_requested:
+                job.status = "cancelled"
+                job.message = "已停止导入任务"
+                job.finished_at = job.finished_at or time.time()
+        persist_job(job)
+
+
 def run_scan(job: ScanJob, request: ScanRequest) -> None:
     worker_threads: List[threading.Thread] = []
     producer_thread: Optional[threading.Thread] = None
@@ -916,7 +1231,7 @@ def run_scan(job: ScanJob, request: ScanRequest) -> None:
         append_log(
             job,
             (
-                f"任务开始 workers={worker_count} convert={request.convert} "
+                f"任务开始 workers={worker_count} convert={request.convert} full_scan={request.full_scan} "
                 f"queue_max={scan_queue.maxsize} dirs={', '.join(request.directories)}"
             ),
         )
@@ -928,7 +1243,7 @@ def run_scan(job: ScanJob, request: ScanRequest) -> None:
         for index in range(worker_count):
             thread = threading.Thread(
                 target=scan_worker,
-                args=(job, scan_queue, sentinel, request.convert),
+                args=(job, scan_queue, sentinel, request.convert, request.full_scan),
                 name=f"scan-worker-{job.id}-{index}",
                 daemon=True,
             )
@@ -1029,6 +1344,33 @@ async def stop_job(job_id: str):
             if len(job.logs) > 500:
                 del job.logs[:-500]
     return job_snapshot(job)
+
+
+@app.post("/api/import")
+async def import_source_file(request: ImportRequest):
+    source_path = validate_source_path(request.path)
+    if not source_path.exists():
+        raise HTTPException(status_code=404, detail=f"源文件不存在: {source_path}")
+    if source_path.is_dir():
+        job = ScanJob(id=uuid.uuid4().hex, message="等待开始导入")
+        worker_count = request.workers or DEFAULT_WORKERS
+        with jobs_lock:
+            jobs[job.id] = job
+        asyncio.get_running_loop().run_in_executor(executor, run_import_directory, job, source_path, worker_count)
+        return {"status": "queued", "job_id": job.id}
+    try:
+        return import_one_source_path(source_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except IsADirectoryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise HTTPException(status_code=500, detail=f"转换 JXL 失败: {detail[-500:]}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"导入失败: {exc}") from exc
 
 
 @app.get("/api/thumbnail")
