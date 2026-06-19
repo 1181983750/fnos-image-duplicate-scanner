@@ -1,11 +1,44 @@
-#!/bin/bash
-set -euo pipefail
+#!/bin/sh
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck disable=SC1091
-source "${SCRIPT_DIR}/_common.sh"
+set -u
 
-init_state
-save_accessible_paths
-rm -f "${TRIM_PKGVAR}/app.pid"
-log_msg "安装初始化完成"
+log_error() {
+    printf '%s\n' "$1" >&2
+}
+
+python_is_311() {
+    candidate="$1"
+    [ -n "${candidate}" ] || return 1
+    command -v "${candidate}" >/dev/null 2>&1 || return 1
+
+    version="$("${candidate}" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' 2>/dev/null || true)"
+    [ "${version}" = "3.11" ] || return 1
+
+    "${candidate}" -m venv --help >/dev/null 2>&1 || return 1
+    return 0
+}
+
+find_python311() {
+    if [ -n "${PYTHON_BIN:-}" ] && python_is_311 "${PYTHON_BIN}"; then
+        command -v "${PYTHON_BIN}"
+        return 0
+    fi
+
+    for candidate in python3.11 /usr/local/bin/python3.11 /usr/bin/python3.11 python3 python; do
+        if python_is_311 "${candidate}"; then
+            command -v "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if python_bin="$(find_python311)"; then
+    printf 'Python 3.11 检测通过: %s\n' "${python_bin}"
+    exit 0
+fi
+
+log_error "未检测到可用的 Python 3.11。"
+log_error "图片重复扫描会优先使用系统自带 Python 3.11.x；如果系统没有，请先安装 python311/python3.11，并确保 python3.11 -m venv 可用。"
+log_error "可通过 SSH 执行以下命令自查：python3.11 -V && python3.11 -m venv --help；若系统 python3 指向 3.11，也可以执行 python3 -V && python3 -m venv --help。"
+exit 1

@@ -1,9 +1,11 @@
-#!/bin/bash
-set -euo pipefail
+#!/bin/sh
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+PACKAGE_ROOT="$(cd "${SCRIPT_DIR}/.." 2>/dev/null && pwd)"
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/_common.sh"
+. "${SCRIPT_DIR}/_common.sh"
 
-init_state
+init_state || exit 1
 log_msg "进入应用配置流程"

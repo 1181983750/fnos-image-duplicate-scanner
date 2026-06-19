@@ -1,17 +1,19 @@
-#!/bin/bash
-set -euo pipefail
+#!/bin/sh
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+PACKAGE_ROOT="$(cd "${SCRIPT_DIR}/.." 2>/dev/null && pwd)"
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/_common.sh"
+. "${SCRIPT_DIR}/_common.sh"
 
-init_state
-save_accessible_paths
+init_state || exit 1
+save_accessible_paths || exit 1
 
 if "${SCRIPT_DIR}/main" status; then
     log_msg "检测到应用正在运行，重启以加载新的授权目录"
-    "${SCRIPT_DIR}/main" stop
-    "${SCRIPT_DIR}/main" start
+    "${SCRIPT_DIR}/main" stop || exit 1
+    "${SCRIPT_DIR}/main" start || exit 1
 fi
 
 log_msg "应用配置已完成"

@@ -33,6 +33,14 @@ function formatDate(seconds) {
   return new Date(seconds * 1000).toLocaleString();
 }
 
+function getDisplaySize(file) {
+  return file?.total_size || file?.size || 0;
+}
+
+function isLivePhoto(file) {
+  return Boolean(file?.live_photo_video_path);
+}
+
 function getFailedPaths(job) {
   const paths = new Set();
   (job?.failed_records || []).forEach((record) => {
@@ -62,6 +70,8 @@ function App() {
   const [serverSettings, setServerSettings] = useState({
     scan_roots: [],
     source_roots: [],
+    supported_extensions: [],
+    supports_live_photo: false,
   });
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState(null);
@@ -245,7 +255,9 @@ function App() {
     const paths = new Set();
     inputGroups.forEach((group) => {
       const ordered = [...group.files].sort((left, right) => {
-        if (right.size !== left.size) return right.size - left.size;
+        const rightSize = getDisplaySize(right);
+        const leftSize = getDisplaySize(left);
+        if (rightSize !== leftSize) return rightSize - leftSize;
         return left.path.localeCompare(right.path);
       });
       ordered.slice(1).forEach((file) => paths.add(file.path));
@@ -268,7 +280,12 @@ function App() {
 
   const deleteSelected = async () => {
     if (selected.size === 0 || deleting) return;
-    const confirmed = window.confirm(`确认删除 ${selected.size} 个文件？该操作不可撤销。`);
+    const selectedFiles = Array.from(selected).map((path) => fileIndex.get(path)).filter(Boolean);
+    const livePhotoCount = selectedFiles.filter((file) => isLivePhoto(file)).length;
+    const confirmMessage = livePhotoCount > 0
+      ? `确认删除 ${selected.size} 个图片文件？其中 ${livePhotoCount} 个是苹果实况照片，会额外删除 ${livePhotoCount} 个配对的 MOV 视频。该操作不可撤销。`
+      : `确认删除 ${selected.size} 个文件？该操作不可撤销。`;
+    const confirmed = window.confirm(confirmMessage);
     if (!confirmed) return;
     setDeleting(true);
     setError("");
@@ -311,6 +328,15 @@ function App() {
   const isRunning = job && !["done", "failed", "cancelled"].includes(job.status);
   const groups = job?.duplicates || [];
   const failedPaths = useMemo(() => getFailedPaths(job), [job]);
+  const fileIndex = useMemo(() => {
+    const map = new Map();
+    groups.forEach((group) => {
+      group.files.forEach((file) => {
+        map.set(file.path, file);
+      });
+    });
+    return map;
+  }, [groups]);
 
   const deleteFailedFiles = async () => {
     if (failedPaths.length === 0 || deleting || isRunning) return;
@@ -344,7 +370,7 @@ function App() {
         <div className="title-row">
           <div>
             <h1>图片重复扫描</h1>
-            <p>扫描 SHA256 和 pHash，支持飞牛授权目录，JPG 无损转 JXL，PNG 质量 90 转 JXL。</p>
+            <p>扫描重复图片，支持 JPG、PNG、WEBP、JXL、HEIC、HEIF，也支持苹果实况照片。</p>
           </div>
           <div className="action-row">
             <button className="primary" onClick={startScan} disabled={directoryList.length === 0 || isRunning}>
@@ -371,7 +397,7 @@ function App() {
           <div className="settings">
             <label className="toggle">
               <input type="checkbox" checked={convert} onChange={(event) => setConvert(event.target.checked)} />
-              <span>转换 JPG/PNG 到 JXL</span>
+              <span>转换 JPG/PNG/HEIC 到 JXL</span>
             </label>
             <label className="toggle">
               <input type="checkbox" checked={fullScan} onChange={(event) => setFullScan(event.target.checked)} />
@@ -392,10 +418,19 @@ function App() {
         </div>
         <div className="helper-card">
           {serverSettings.scan_roots?.length > 0 ? (
-            <p>
-              已授权目录：
-              <code>{serverSettings.scan_roots.join(" / ")}</code>
-            </p>
+            <>
+              <p>
+                已授权目录：
+                <code>{serverSettings.scan_roots.join(" / ")}</code>
+              </p>
+              <p>
+                支持格式：
+                <code>{serverSettings.supported_extensions?.join(" ") || ".jpg .jpeg .png .webp .jxl .heic .heif"}</code>
+              </p>
+              {serverSettings.supports_live_photo && (
+                <p>如果是苹果实况照片，应用会把同名的 <code>.mov</code> 一起识别；删图片时，也会一起删掉配对视频。</p>
+              )}
+            </>
           ) : (
             <p>
               还没有可用授权目录。请先到飞牛「应用设置」里的「授权目录」添加图片目录，再输入像
@@ -409,7 +444,7 @@ function App() {
         <div className="title-row">
           <div>
             <h2>导入源文件</h2>
-            <p>可导入整个已授权目录，或导入某个具体图片文件路径。</p>
+            <p>可导入整个已授权目录，或导入某个具体图片文件路径；苹果实况照片会连同配对视频一起带入。</p>
           </div>
           <button className="primary" onClick={importSourceFile} disabled={!sourceFile.trim() || importing}>
             {importing ? <Loader2 className="spin" size={18} /> : <FolderSearch size={18} />}
@@ -538,7 +573,15 @@ function App() {
             <img src={`${API}/preview?path=${encodeURIComponent(previewFile.path)}`} alt="" />
             <div className="preview-meta">
               <strong>{previewFile.path.split("/").pop()}</strong>
-              <span>{previewFile.width || "-"} × {previewFile.height || "-"} · {formatBytes(previewFile.size)}</span>
+              {isLivePhoto(previewFile) ? (
+                <>
+                  <span>{previewFile.width || "-"} × {previewFile.height || "-"} · 总占用 {formatBytes(getDisplaySize(previewFile))}</span>
+                  <span>照片 {formatBytes(previewFile.size)} + 视频 {formatBytes(previewFile.live_photo_video_size)}</span>
+                  <code>{previewFile.live_photo_video_path}</code>
+                </>
+              ) : (
+                <span>{previewFile.width || "-"} × {previewFile.height || "-"} · {formatBytes(previewFile.size)}</span>
+              )}
               <code>{previewFile.path}</code>
             </div>
           </div>
@@ -607,8 +650,19 @@ function DuplicateGroup({ group, index, selected, onToggle, onPreview, onSelectS
                 {checked ? <X size={16} /> : <Trash2 size={16} />}
               </button>
               <div className="meta">
-                <strong>{file.path.split("/").pop()}</strong>
-                <span>{file.width || "-"} × {file.height || "-"} · {formatBytes(file.size)}</span>
+                <div className="meta-title">
+                  <strong>{file.path.split("/").pop()}</strong>
+                  {isLivePhoto(file) && <span className="live-badge">实况照片</span>}
+                </div>
+                {isLivePhoto(file) ? (
+                  <>
+                    <span>{file.width || "-"} × {file.height || "-"} · 总占用 {formatBytes(getDisplaySize(file))}</span>
+                    <span>照片 {formatBytes(file.size)} + 视频 {formatBytes(file.live_photo_video_size)}</span>
+                    <code title={file.live_photo_video_path}>{file.live_photo_video_path}</code>
+                  </>
+                ) : (
+                  <span>{file.width || "-"} × {file.height || "-"} · {formatBytes(file.size)}</span>
+                )}
                 <span>{formatDate(file.modified_at)}</span>
                 <code title={file.path}>{file.path}</code>
                 {file.converted_from && <em>转换自 {file.converted_from}</em>}

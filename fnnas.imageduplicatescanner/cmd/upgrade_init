@@ -1,10 +1,12 @@
-#!/bin/bash
-set -euo pipefail
+#!/bin/sh
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+PACKAGE_ROOT="$(cd "${SCRIPT_DIR}/.." 2>/dev/null && pwd)"
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/_common.sh"
+. "${SCRIPT_DIR}/_common.sh"
 
-init_state
-rm -f "${TRIM_PKGVAR}/requirements.sha256"
+init_state || exit 1
+rm -f "${REQ_HASH_FILE}" "${RUNTIME_INFO_FILE}" 2>/dev/null || true
 log_msg "升级初始化完成，下一次启动将重新校验 Python 依赖"

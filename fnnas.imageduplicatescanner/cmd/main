@@ -1,67 +1,72 @@
-#!/bin/bash
-set -euo pipefail
+#!/bin/sh
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+PACKAGE_ROOT="$(cd "${SCRIPT_DIR}/.." 2>/dev/null && pwd)"
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/_common.sh"
+. "${SCRIPT_DIR}/_common.sh"
 
-PID_FILE="${TRIM_PKGVAR}/app.pid"
 APP_PORT="${TRIM_SERVICE_PORT:-15021}"
 
 check_process() {
-    local pid="$1"
+    pid="$1"
     kill -0 "${pid}" 2>/dev/null
 }
 
 status() {
     if [ -f "${PID_FILE}" ]; then
-        local pid
-        pid="$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')"
+        pid="$(head -n 1 "${PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
         if [ -n "${pid}" ] && check_process "${pid}"; then
             return 0
         fi
-        rm -f "${PID_FILE}"
+        rm -f "${PID_FILE}" 2>/dev/null || true
     fi
     return 1
 }
 
 start_process() {
-    init_state
+    init_state || return 1
     if status; then
         log_msg "应用已在运行"
         return 0
     fi
 
-    prepare_python_runtime
+    if [ ! -d "${APPDEST_ROOT}/server" ]; then
+        log_msg "应用目录不存在: ${APPDEST_ROOT}/server"
+        return 1
+    fi
+
+    prepare_python_runtime || return 1
     load_accessible_paths
 
     log_msg "启动图片重复扫描，端口 ${APP_PORT}"
     (
-        cd "${TRIM_APPDEST}/server"
+        cd "${APPDEST_ROOT}/server" || exit 1
         export PYTHONUNBUFFERED=1
-        export SCANNER_DB="${TRIM_PKGVAR}/scanner.db"
+        export SCANNER_DB="${PKGVAR_ROOT}/scanner.db"
         export SCAN_ROOTS="${ACCESSIBLE_PATHS:-}"
         export SOURCE_ROOTS="${ACCESSIBLE_PATHS:-}"
-        export STATIC_DIR="${TRIM_APPDEST}/server/static"
+        export STATIC_DIR="${APPDEST_ROOT}/server/static"
         exec "${VENV_DIR}/bin/uvicorn" main:app --host 0.0.0.0 --port "${APP_PORT}"
     ) >> "${LOG_FILE}" 2>&1 &
 
     printf '%s' "$!" > "${PID_FILE}"
     log_msg "应用启动完成 pid=$!"
+    return 0
 }
 
 stop_process() {
-    init_state
+    init_state || return 1
     log_msg "停止图片重复扫描"
 
     if [ -f "${PID_FILE}" ]; then
-        local pid
-        pid="$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')"
+        pid="$(head -n 1 "${PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
         if [ -n "${pid}" ] && check_process "${pid}"; then
             kill -TERM "${pid}" >> "${LOG_FILE}" 2>&1 || true
-            for _ in $(seq 1 10); do
+            for _wait in 1 2 3 4 5 6 7 8 9 10; do
                 if ! check_process "${pid}"; then
-                    rm -f "${PID_FILE}"
+                    rm -f "${PID_FILE}" 2>/dev/null || true
                     log_msg "应用已停止"
                     return 0
                 fi
@@ -69,7 +74,7 @@ stop_process() {
             done
             kill -KILL "${pid}" >> "${LOG_FILE}" 2>&1 || true
         fi
-        rm -f "${PID_FILE}"
+        rm -f "${PID_FILE}" 2>/dev/null || true
     fi
 
     return 0
@@ -85,9 +90,8 @@ stop)
 status)
     if status; then
         exit 0
-    else
-        exit 3
     fi
+    exit 3
     ;;
 *)
     exit 1

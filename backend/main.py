@@ -24,11 +24,24 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps, UnidentifiedImageError, features
 from pydantic import BaseModel, Field
+from pillow_heif import register_heif_opener
 import pillow_jxl  # noqa: F401  # Registers JPEG XL support for Pillow.
 
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".jxl"}
-CONVERT_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".jxl",
+    ".heic",
+    ".heif",
+    ".heics",
+    ".heifs",
+    ".hif",
+}
+CONVERT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".heics", ".heifs", ".hif"}
+LIVE_PHOTO_VIDEO_EXTENSIONS = {".mov"}
 CPU_THREADS = os.cpu_count() or 4
 DEFAULT_WORKERS = min(4, CPU_THREADS)
 MAX_WORKERS = max(DEFAULT_WORKERS, min(64, CPU_THREADS))
@@ -49,6 +62,7 @@ SOURCE_ROOTS = [
 ]
 WEBP_SUPPORTED = features.check("webp")
 Image.MAX_IMAGE_PIXELS = None
+register_heif_opener(thumbnails=False)
 
 app = FastAPI(title="Image Duplicate Scanner")
 app.add_middleware(
@@ -86,10 +100,13 @@ class ImageRecord:
     path: str
     size: int
     modified_at: float
+    total_size: int = 0
     sha256: Optional[str] = None
     phash: Optional[str] = None
     width: Optional[int] = None
     height: Optional[int] = None
+    live_photo_video_path: Optional[str] = None
+    live_photo_video_size: int = 0
     converted_from: Optional[str] = None
     conversion_error: Optional[str] = None
     scan_error: Optional[str] = None
@@ -214,19 +231,33 @@ def cache_find_duplicates(sha256: Optional[str], phash: Optional[str]) -> List[d
             """,
             params,
         ).fetchall()
-    return [
-        {
-            "path": row[0],
-            "size": row[1],
-            "modified_at": row[2],
-            "sha256": row[3],
-            "phash": row[4],
-            "width": row[5],
-            "height": row[6],
-            "match_type": "sha256" if sha256 and row[3] == sha256 else "phash",
-        }
-        for row in rows
-    ]
+    duplicates = []
+    for row in rows:
+        image_path = Path(row[0])
+        live_video_path = live_photo_video_path_for_image(image_path)
+        live_video_size = 0
+        if live_video_path is not None:
+            try:
+                live_video_size = live_video_path.stat().st_size
+            except OSError:
+                live_video_size = 0
+
+        duplicates.append(
+            {
+                "path": row[0],
+                "size": row[1],
+                "total_size": row[1] + live_video_size,
+                "modified_at": row[2],
+                "sha256": row[3],
+                "phash": row[4],
+                "width": row[5],
+                "height": row[6],
+                "live_photo_video_path": str(live_video_path) if live_video_path else None,
+                "live_photo_video_size": live_video_size,
+                "match_type": "sha256" if sha256 and row[3] == sha256 else "phash",
+            }
+        )
+    return duplicates
 
 
 def cache_put(record: ImageRecord) -> None:
@@ -635,6 +666,20 @@ def validate_source_path(raw_path: str) -> Path:
     return path
 
 
+def delete_image_and_live_photo(path: Path) -> List[str]:
+    deleted_paths = []
+    if path.exists() and path.is_file():
+        path.unlink()
+        deleted_paths.append(str(path))
+
+    video_path = live_photo_video_path_for_image(path)
+    if video_path is not None and video_path.exists() and video_path.is_file():
+        video_path.unlink()
+        deleted_paths.append(str(video_path))
+
+    return deleted_paths
+
+
 def discover_images(directories: List[str], job: ScanJob, scan_queue: queue.Queue, worker_count: int, sentinel) -> None:
     seen = set() if len(directories) > 1 else None
     for raw_dir in directories:
@@ -734,11 +779,21 @@ def import_one_source_path(source_path: Path) -> dict:
             "duplicates": duplicates,
         }
 
-    target_path = jxl_import_target(source_path, source_record.sha256 or uuid.uuid4().hex)
+    source_video_path = live_photo_video_path_for_image(source_path)
+    target_path = ensure_live_photo_import_target(
+        source_path,
+        source_record.sha256 or uuid.uuid4().hex,
+        source_video_path,
+    )
     convert_source_to_jxl(source_path, target_path)
+    copied_video_path = None
+    if source_video_path is not None:
+        copied_video_path = copy_live_photo_video(source_video_path, target_path)
     imported_record = scan_image(target_path, converted_from=source_path, ignore_cache=True)
     if imported_record.scan_error:
         target_path.unlink(missing_ok=True)
+        if copied_video_path is not None:
+            copied_video_path.unlink(missing_ok=True)
         raise RuntimeError(f"导入后扫描失败: {imported_record.scan_error}")
     cache_put(imported_record)
     return {
@@ -809,6 +864,67 @@ def phash_from_memory(memory: bytes) -> tuple[str, float]:
     return f"{value:016x}", dct_seconds
 
 
+def live_photo_video_path_for_image(path: Path) -> Optional[Path]:
+    direct_candidates = [path.with_suffix(".mov"), path.with_suffix(".MOV")]
+    for candidate in direct_candidates:
+        if candidate != path and candidate.exists() and candidate.is_file():
+            return candidate.resolve()
+
+    for candidate in path.parent.glob(f"{path.stem}.*"):
+        if candidate == path or not candidate.is_file():
+            continue
+        if candidate.suffix.lower() in LIVE_PHOTO_VIDEO_EXTENSIONS:
+            return candidate.resolve()
+    return None
+
+
+def apply_live_photo_metadata(record: ImageRecord, image_path: Path) -> None:
+    video_path = live_photo_video_path_for_image(image_path)
+    if video_path is None:
+        record.total_size = record.size
+        return
+
+    try:
+        video_size = video_path.stat().st_size
+    except OSError:
+        video_size = 0
+
+    record.live_photo_video_path = str(video_path)
+    record.live_photo_video_size = video_size
+    record.total_size = record.size + video_size
+
+
+def live_photo_target_video_path(image_target_path: Path, source_video_path: Path) -> Path:
+    return image_target_path.with_suffix(source_video_path.suffix.lower())
+
+
+def copy_live_photo_video(source_video_path: Path, image_target_path: Path) -> Path:
+    target_video_path = live_photo_target_video_path(image_target_path, source_video_path)
+    target_video_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_video_path, target_video_path)
+    return target_video_path
+
+
+def ensure_live_photo_import_target(
+    source_path: Path,
+    source_sha256: str,
+    source_video_path: Optional[Path],
+) -> Path:
+    target_path = jxl_import_target(source_path, source_sha256)
+    if source_video_path is None:
+        return target_path
+
+    target_video_path = live_photo_target_video_path(target_path, source_video_path)
+    if not target_video_path.exists():
+        return target_path
+
+    alternative = target_path.with_name(f"{target_path.stem}-{source_sha256[:12]}{target_path.suffix}")
+    if not live_photo_target_video_path(alternative, source_video_path).exists():
+        return alternative
+
+    return target_path.with_name(f"{target_path.stem}-{uuid.uuid4().hex[:8]}{target_path.suffix}")
+
+
 def phash_image_file(path: Path) -> tuple[str, int, int, float, float, float]:
     open_started = time.perf_counter()
     image = load_image(path)
@@ -869,9 +985,11 @@ def scan_image(
         path=str(path),
         size=stat.st_size,
         modified_at=stat.st_mtime,
+        total_size=stat.st_size,
         converted_from=str(converted_from) if converted_from else None,
     )
     try:
+        apply_live_photo_metadata(record, path)
         cached = None if ignore_cache else cache_get(path, record.size, record.modified_at)
         if cached:
             record.sha256 = cached["sha256"]
@@ -1311,6 +1429,8 @@ async def get_settings():
     return {
         "scan_roots": [str(root) for root in SCAN_ROOTS],
         "source_roots": [str(root) for root in SOURCE_ROOTS],
+        "supported_extensions": sorted(IMAGE_EXTENSIONS),
+        "supports_live_photo": True,
         "default_workers": DEFAULT_WORKERS,
         "max_workers": MAX_WORKERS,
         "static_ready": STATIC_DIR.exists(),
@@ -1400,8 +1520,7 @@ async def delete_files(request: DeleteRequest):
             continue
         if path.suffix.lower() not in IMAGE_EXTENSIONS:
             raise HTTPException(status_code=400, detail=f"不允许删除非图片文件: {path}")
-        path.unlink()
-        deleted.append(str(path))
+        deleted.extend(delete_image_and_live_photo(path))
     cache_delete_paths(deleted)
     snapshots = remove_deleted_records_from_jobs(deleted)
     for snapshot in snapshots:
@@ -1413,6 +1532,7 @@ async def delete_files(request: DeleteRequest):
 async def health():
     tools = {
         "jpeg_xl": ".jxl" in Image.registered_extensions(),
+        "heif": ".heic" in Image.registered_extensions(),
         "webp": WEBP_SUPPORTED,
     }
     status_code = 200 if all(tools.values()) else 503
