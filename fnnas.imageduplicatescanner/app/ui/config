@@ -1,0 +1,12 @@
+{
+    ".url": {
+        "fnnas.imageduplicatescanner.Application": {
+            "title": "图片重复扫描",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "port": "15021",
+            "allUsers": false
+        }
+    }
+}

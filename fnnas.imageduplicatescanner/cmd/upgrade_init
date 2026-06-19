@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/_common.sh"
+
+init_state
+rm -f "${TRIM_PKGVAR}/requirements.sha256"
+log_msg "升级初始化完成，下一次启动将重新校验 Python 依赖"

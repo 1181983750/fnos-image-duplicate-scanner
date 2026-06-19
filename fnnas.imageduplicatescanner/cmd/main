@@ -1,0 +1,95 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/_common.sh"
+
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+APP_PORT="${TRIM_SERVICE_PORT:-15021}"
+
+check_process() {
+    local pid="$1"
+    kill -0 "${pid}" 2>/dev/null
+}
+
+status() {
+    if [ -f "${PID_FILE}" ]; then
+        local pid
+        pid="$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')"
+        if [ -n "${pid}" ] && check_process "${pid}"; then
+            return 0
+        fi
+        rm -f "${PID_FILE}"
+    fi
+    return 1
+}
+
+start_process() {
+    init_state
+    if status; then
+        log_msg "应用已在运行"
+        return 0
+    fi
+
+    prepare_python_runtime
+    load_accessible_paths
+
+    log_msg "启动图片重复扫描，端口 ${APP_PORT}"
+    (
+        cd "${TRIM_APPDEST}/server"
+        export PYTHONUNBUFFERED=1
+        export SCANNER_DB="${TRIM_PKGVAR}/scanner.db"
+        export SCAN_ROOTS="${ACCESSIBLE_PATHS:-}"
+        export SOURCE_ROOTS="${ACCESSIBLE_PATHS:-}"
+        export STATIC_DIR="${TRIM_APPDEST}/server/static"
+        exec "${VENV_DIR}/bin/uvicorn" main:app --host 0.0.0.0 --port "${APP_PORT}"
+    ) >> "${LOG_FILE}" 2>&1 &
+
+    printf '%s' "$!" > "${PID_FILE}"
+    log_msg "应用启动完成 pid=$!"
+}
+
+stop_process() {
+    init_state
+    log_msg "停止图片重复扫描"
+
+    if [ -f "${PID_FILE}" ]; then
+        local pid
+        pid="$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')"
+        if [ -n "${pid}" ] && check_process "${pid}"; then
+            kill -TERM "${pid}" >> "${LOG_FILE}" 2>&1 || true
+            for _ in $(seq 1 10); do
+                if ! check_process "${pid}"; then
+                    rm -f "${PID_FILE}"
+                    log_msg "应用已停止"
+                    return 0
+                fi
+                sleep 1
+            done
+            kill -KILL "${pid}" >> "${LOG_FILE}" 2>&1 || true
+        fi
+        rm -f "${PID_FILE}"
+    fi
+
+    return 0
+}
+
+case "${1:-}" in
+start)
+    start_process
+    ;;
+stop)
+    stop_process
+    ;;
+status)
+    if status; then
+        exit 0
+    else
+        exit 3
+    fi
+    ;;
+*)
+    exit 1
+    ;;
+esac

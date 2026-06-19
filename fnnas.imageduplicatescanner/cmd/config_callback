@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/_common.sh"
+
+init_state
+save_accessible_paths
+
+if "${SCRIPT_DIR}/main" status; then
+    log_msg "检测到应用正在运行，重启以加载新的授权目录"
+    "${SCRIPT_DIR}/main" stop
+    "${SCRIPT_DIR}/main" start
+fi
+
+log_msg "应用配置已完成"

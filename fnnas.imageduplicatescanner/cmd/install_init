@@ -1,0 +1,11 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/_common.sh"
+
+init_state
+save_accessible_paths
+rm -f "${TRIM_PKGVAR}/app.pid"
+log_msg "安装初始化完成"

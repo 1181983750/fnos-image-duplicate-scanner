@@ -54,11 +54,15 @@ function App() {
       return {};
     }
   }, []);
-  const [directories, setDirectories] = useState(initialSettings.directories || "/scan");
+  const [directories, setDirectories] = useState(initialSettings.directories || "");
   const [convert, setConvert] = useState(Boolean(initialSettings.convert));
   const [fullScan, setFullScan] = useState(Boolean(initialSettings.fullScan));
   const [workers, setWorkers] = useState(initialSettings.workers || "");
-  const [sourceFile, setSourceFile] = useState(initialImportSettings.sourceFile || "/source");
+  const [sourceFile, setSourceFile] = useState(initialImportSettings.sourceFile || "");
+  const [serverSettings, setServerSettings] = useState({
+    scan_roots: [],
+    source_roots: [],
+  });
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState(null);
   const [jobId, setJobId] = useState(null);
@@ -73,6 +77,33 @@ function App() {
     () => directories.split("\n").map((item) => item.trim()).filter(Boolean),
     [directories]
   );
+
+  useEffect(() => {
+    let stopped = false;
+    const loadSettings = async () => {
+      try {
+        const response = await fetch(`${API}/settings`);
+        if (!response.ok) return;
+        const data = await response.json();
+        if (stopped) return;
+        setServerSettings(data);
+        if (!initialSettings.directories && data.scan_roots?.length) {
+          setDirectories(data.scan_roots.join("\n"));
+        }
+        if (!initialImportSettings.sourceFile) {
+          const firstSource = data.source_roots?.[0] || data.scan_roots?.[0] || "";
+          setSourceFile(firstSource);
+        }
+      } catch {
+        // Keep local defaults if settings API is unavailable.
+      }
+    };
+
+    loadSettings();
+    return () => {
+      stopped = true;
+    };
+  }, [initialImportSettings.sourceFile, initialSettings.directories]);
 
   useEffect(() => {
     let stopped = false;
@@ -313,7 +344,7 @@ function App() {
         <div className="title-row">
           <div>
             <h1>图片重复扫描</h1>
-            <p>扫描 SHA256 和 pHash，JPG 无损转 JXL，PNG 质量 90 转 JXL。</p>
+            <p>扫描 SHA256 和 pHash，支持飞牛授权目录，JPG 无损转 JXL，PNG 质量 90 转 JXL。</p>
           </div>
           <div className="action-row">
             <button className="primary" onClick={startScan} disabled={directoryList.length === 0 || isRunning}>
@@ -333,6 +364,7 @@ function App() {
             <textarea
               value={directories}
               onChange={(event) => setDirectories(event.target.value)}
+              placeholder="/vol1/1000/图片库"
               spellCheck="false"
             />
           </label>
@@ -358,13 +390,26 @@ function App() {
             </label>
           </div>
         </div>
+        <div className="helper-card">
+          {serverSettings.scan_roots?.length > 0 ? (
+            <p>
+              已授权目录：
+              <code>{serverSettings.scan_roots.join(" / ")}</code>
+            </p>
+          ) : (
+            <p>
+              还没有可用授权目录。请先到飞牛「应用设置」里的「授权目录」添加图片目录，再输入像
+              <code>/vol1/1000/图片库</code> 这样的完整路径。
+            </p>
+          )}
+        </div>
       </section>
 
       <section className="control-band import-band">
         <div className="title-row">
           <div>
             <h2>导入源文件</h2>
-            <p>可输入 /source 导入整个源目录，或输入具体图片文件路径。</p>
+            <p>可导入整个已授权目录，或导入某个具体图片文件路径。</p>
           </div>
           <button className="primary" onClick={importSourceFile} disabled={!sourceFile.trim() || importing}>
             {importing ? <Loader2 className="spin" size={18} /> : <FolderSearch size={18} />}
@@ -376,7 +421,7 @@ function App() {
             <span>源文件路径</span>
             <input
               type="text"
-              placeholder="/source/008c203cb0ce5cf56005d114db47990b.jpg"
+              placeholder="/vol1/1000/待整理/008c203cb0ce5cf56005d114db47990b.jpg"
               value={sourceFile}
               onChange={(event) => setSourceFile(event.target.value)}
               spellCheck="false"

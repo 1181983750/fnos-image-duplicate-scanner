@@ -1,0 +1,15 @@
+appname=fnnas.imageduplicatescanner
+version=1.0.0
+display_name=图片重复扫描
+desc=帮你找出重复图片，支持预览、勾选删除，也可以把 JPG 和 PNG 转成更省空间的 JXL。
+platform=all
+source=thirdparty
+maintainer=1181983750
+maintainer_url=https://github.com/1181983750/fnos-image-duplicate-scanner
+distributor=1181983750
+distributor_url=https://github.com/1181983750/fnos-image-duplicate-scanner
+os_min_version=1.1.8
+desktop_uidir=ui
+desktop_applaunchname=fnnas.imageduplicatescanner.Application
+service_port=15021
+install_dep_apps=python312
